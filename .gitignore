@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Operating System & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Internal tool configurations
+.codegraph/
+.rtk/
+*.log
+
+# Generated test output documents (large binary files)
+refreacted/*.xlsm
+refreacted/*.pdf
