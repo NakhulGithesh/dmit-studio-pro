@@ -1,6 +1,13 @@
+import os
+
 import streamlit as st
-import io
-from dmit_processor import process_excel, process_pdf, _pdf_to_docx, build_composite_branding_image
+
+from dmit_processor import (
+    _pdf_to_docx,
+    build_composite_branding_image,
+    process_excel,
+    process_pdf,
+)
 
 # Streamlit Page Configuration
 st.set_page_config(
@@ -150,37 +157,46 @@ with col2:
         st.markdown('<div class="section-title">Generate Re-Branded Report</div>', unsafe_allow_html=True)
 
         if uploaded_file:
-            file_ext = uploaded_file.name.split(".")[-1].lower()
+            file_ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
             file_bytes = uploaded_file.getvalue()
+            base_name = os.path.splitext(uploaded_file.name)[0]
 
             st.success(f"Loaded: **{uploaded_file.name}** ({len(file_bytes) / 1024 / 1024:.2f} MB)")
 
             if st.button("🚀 Process & Generate Downloads", type="primary", use_container_width=True):
                 with st.spinner("Processing report re-branding..."):
-                    if file_ext == "xlsm":
-                        result = process_excel(
-                            file_bytes=file_bytes,
-                            logo_bytes=logo_bytes,
-                            text_details=text_details,
-                            footer_company=footer_company,
-                            footer_contact=footer_contact
-                        )
-                    else:
-                        result = process_pdf(
-                            file_bytes=file_bytes,
-                            logo_bytes=logo_bytes,
-                            text_details=text_details,
-                            footer_company=footer_company,
-                            footer_contact=footer_contact
-                        )
+                    try:
+                        if file_ext == "xlsm":
+                            result = process_excel(
+                                file_bytes=file_bytes,
+                                logo_bytes=logo_bytes,
+                                text_details=text_details,
+                                footer_company=footer_company,
+                                footer_contact=footer_contact
+                            )
+                        elif file_ext == "pdf":
+                            result = process_pdf(
+                                file_bytes=file_bytes,
+                                logo_bytes=logo_bytes,
+                                text_details=text_details,
+                                footer_company=footer_company,
+                                footer_contact=footer_contact
+                            )
+                        else:
+                            st.error(f"Unsupported file format: .{file_ext}")
+                            result = None
 
-                    st.session_state["result"] = result
-                    st.session_state["processed_ext"] = file_ext
-                    st.success("✨ Re-branding completed!")
+                        if result:
+                            st.session_state["result"] = result
+                            st.session_state["processed_ext"] = file_ext
+                            st.session_state["base_name"] = base_name
+                            st.success("✨ Re-branding completed!")
+                    except Exception as err:
+                        st.error(f"Processing error: {err}")
 
             if "result" in st.session_state:
                 res = st.session_state["result"]
-                ext = st.session_state["processed_ext"]
+                base_out_name = st.session_state.get("base_name", "Report")
 
                 st.write("---")
                 st.write("**Download Formats:**")
@@ -189,7 +205,7 @@ with col2:
                     st.download_button(
                         label="📊 Download Re-Branded Excel (.xlsm)",
                         data=res["xlsm"],
-                        file_name=f"Rebranded_{uploaded_file.name}",
+                        file_name=f"Rebranded_{base_out_name}.xlsm",
                         mime="application/vnd.ms-excel.sheet.macroEnabled.12",
                         use_container_width=True
                     )
@@ -198,7 +214,7 @@ with col2:
                     st.download_button(
                         label="📄 Download Re-Branded PDF (.pdf)",
                         data=res["pdf"],
-                        file_name=f"Rebranded_{uploaded_file.name.replace('.' + ext, '.pdf')}",
+                        file_name=f"Rebranded_{base_out_name}.pdf",
                         mime="application/pdf",
                         use_container_width=True
                     )
@@ -209,16 +225,25 @@ with col2:
                 with col_d2:
                     if st.button("Generate .docx", use_container_width=True):
                         with st.spinner("Converting PDF to Word (.docx)..."):
-                            pdf_data = res.get("pdf")
-                            if pdf_data:
-                                docx_bytes = _pdf_to_docx(pdf_data)
-                                st.session_state["docx_bytes"] = docx_bytes
+                            try:
+                                pdf_data = res.get("pdf")
+                                if pdf_data:
+                                    docx_bytes = _pdf_to_docx(pdf_data)
+                                    if docx_bytes:
+                                        st.session_state["docx_bytes"] = docx_bytes
+                                        st.success("Word document generated!")
+                                    else:
+                                        st.error("Failed to convert PDF to Word (.docx).")
+                                else:
+                                    st.error("No PDF data available for conversion.")
+                            except Exception as err:
+                                st.error(f"Word export error: {err}")
 
-                if "docx_bytes" in st.session_state and st.session_state["docx_bytes"]:
+                if st.session_state.get("docx_bytes"):
                     st.download_button(
                         label="⬇️ Download Word Document (.docx)",
                         data=st.session_state["docx_bytes"],
-                        file_name=f"Rebranded_{uploaded_file.name.replace('.' + ext, '.docx')}",
+                        file_name=f"Rebranded_{base_out_name}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         use_container_width=True
                     )

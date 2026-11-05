@@ -1,13 +1,20 @@
-import os
-import re
 import io
-import zipfile
+import os
 import subprocess
 import tempfile
-from PIL import Image, ImageDraw, ImageFont
+import zipfile
+from xml.sax.saxutils import escape as xml_escape
+
 import fitz  # PyMuPDF
 from pdf2docx import Converter
+from PIL import Image, ImageDraw, ImageFont
 
+# Security limits for Zip and Image processing (DoS / Zip Bomb defense)
+MAX_ZIP_ENTRIES = 1000
+MAX_SINGLE_FILE_BYTES = 30 * 1024 * 1024       # 30 MB uncompressed per entry
+MAX_TOTAL_UNCOMPRESSED_BYTES = 100 * 1024 * 1024  # 100 MB total uncompressed
+MAX_COMPRESSION_RATIO = 15.0                   # Max ratio for entries > 1 MB
+MAX_IMAGE_DIMENSION = 4096                     # Max width or height for uploaded logos
 
 # Target cover logo image files in DMIT report Excel archive
 COVER_LOGO_IMAGES = {
@@ -21,6 +28,48 @@ COVER_LOGO_IMAGES = {
 }
 
 COVER_LOGO_RIDS = ["rId8", "rId87", "rId88", "rId89", "rId90", "rId91", "rId92"]
+
+
+def sanitize_excel_val(val: str) -> str:
+    """
+    Sanitizes user input string for safe OpenXML injection:
+    1. Neutralizes Excel CSV / Formula injection (=, +, -, @, \\t, \\r).
+    2. Escapes XML special characters (&, <, >, \", \') to prevent corruption and XXE.
+    """
+    if not val:
+        return ""
+    val_str = str(val).strip()
+    if val_str.startswith(("=", "+", "-", "@", "\t", "\r")):
+        val_str = "'" + val_str
+    return xml_escape(val_str, entities={'"': "&quot;", "'": "&apos;"})
+
+
+def validate_zip_archive(archive: zipfile.ZipFile) -> None:
+    """
+    Validates zip archive against zip bombs and memory exhaustion attacks.
+    Raises ValueError if thresholds are exceeded.
+    """
+    entries = archive.infolist()
+    if len(entries) > MAX_ZIP_ENTRIES:
+        raise ValueError(f"Security Alert: Archive exceeds file entry limit ({len(entries)} > {MAX_ZIP_ENTRIES})")
+
+    cumulative_uncompressed = 0
+    for entry in entries:
+        cumulative_uncompressed += entry.file_size
+        if entry.file_size > MAX_SINGLE_FILE_BYTES:
+            raise ValueError(
+                f"Security Alert: File '{entry.filename}' exceeds uncompressed size limit ({entry.file_size} bytes)"
+            )
+        if cumulative_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"Security Alert: Cumulative archive size exceeds limit ({cumulative_uncompressed} bytes)"
+            )
+        if entry.compress_size > 0 and entry.file_size > 1024 * 1024:
+            ratio = entry.file_size / entry.compress_size
+            if ratio > MAX_COMPRESSION_RATIO:
+                raise ValueError(
+                    f"Security Alert: Entry '{entry.filename}' has excessive compression ratio ({ratio:.1f}:1)"
+                )
 
 
 def build_composite_branding_image(
@@ -39,13 +88,20 @@ def build_composite_branding_image(
     """
     padding = 24
 
+    # Enforce safe decompression limit in Pillow
+    Image.MAX_IMAGE_PIXELS = 10_000_000
+
     # 1. Process uploaded logo image if provided
     logo_img = None
     if logo_bytes:
         try:
-            logo_img = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
+            with Image.open(io.BytesIO(logo_bytes)) as raw_img:
+                if raw_img.width > MAX_IMAGE_DIMENSION or raw_img.height > MAX_IMAGE_DIMENSION:
+                    raise ValueError(f"Logo dimensions exceed maximum allowable {MAX_IMAGE_DIMENSION}px")
+                logo_img = raw_img.convert("RGBA")
         except Exception as e:
             print(f"Error opening logo bytes: {e}")
+            logo_img = None
 
     logo_w, logo_h = 0, 0
     if logo_img:
@@ -81,16 +137,16 @@ def build_composite_branding_image(
             try:
                 font_title = ImageFont.truetype(p, title_size)
                 break
-            except Exception:
-                pass
+            except (OSError, ValueError):
+                continue
 
     for p in font_paths_reg:
         if os.path.exists(p):
             try:
                 font_medium = ImageFont.truetype(p, medium_size)
                 break
-            except Exception:
-                pass
+            except (OSError, ValueError):
+                continue
 
     if not font_title:
         try:
@@ -174,6 +230,9 @@ def process_excel(
     Replaces cover logo image with combined Logo + Name + Email + Phone block.
     Returns dict: {"xlsm": bytes, "pdf": bytes, "docx": bytes}
     """
+    if not file_bytes:
+        raise ValueError("Source Excel file is empty.")
+
     text_details = text_details or {}
     company_name = text_details.get("company_name", "") or footer_company
     email_addr = text_details.get("email", "")
@@ -187,7 +246,15 @@ def process_excel(
         phone=phone_num
     )
 
+    # Open archive and validate against zip bombs
     input_zip = zipfile.ZipFile(io.BytesIO(file_bytes), 'r')
+    validate_zip_archive(input_zip)
+
+    # Sanitize user inputs for OpenXML injection safety
+    safe_footer_company = sanitize_excel_val(footer_company)
+    safe_footer_contact = sanitize_excel_val(footer_contact)
+    safe_email_addr = sanitize_excel_val(email_addr)
+
     output_io = io.BytesIO()
 
     with zipfile.ZipFile(output_io, 'w', zipfile.ZIP_DEFLATED) as output_zip:
@@ -199,23 +266,23 @@ def process_excel(
             if filename in COVER_LOGO_IMAGES or (filename.startswith("xl/media/image6") and filename.endswith(".png")):
                 content = composite_logo_bytes
 
-            # 2. Global String Replacements in XML files
-            if filename.endswith(".xml") or filename.endswith(".rels"):
+            # 2. Global String Replacements in XML files with sanitized values
+            if filename.endswith((".xml", ".rels")):
                 text_content = content.decode("utf-8", errors="ignore")
 
                 if "THE MIND MYSTERY" in text_content:
-                    text_content = text_content.replace("THE MIND MYSTERY", footer_company)
+                    text_content = text_content.replace("THE MIND MYSTERY", safe_footer_company)
 
                 if "Support- 8075891014 || Mail: mindmysteryinstitute@hotmail.com" in text_content:
                     text_content = text_content.replace(
                         "Support- 8075891014 || Mail: mindmysteryinstitute@hotmail.com",
-                        footer_contact
+                        safe_footer_contact
                     )
 
-                if "mindmysteryinstitute@hotmail.com" in text_content and email_addr:
+                if "mindmysteryinstitute@hotmail.com" in text_content and safe_email_addr:
                     text_content = text_content.replace(
                         "mindmysteryinstitute@hotmail.com",
-                        email_addr
+                        safe_email_addr
                     )
 
                 content = text_content.encode("utf-8")
@@ -224,7 +291,7 @@ def process_excel(
 
     xlsm_out_bytes = output_io.getvalue()
 
-    # Generate PDF export via LibreOffice
+    # Generate PDF export via sandboxed LibreOffice
     pdf_out_bytes = _excel_to_pdf(xlsm_out_bytes)
 
     return {
@@ -247,6 +314,9 @@ def process_pdf(
     Inserts combined Logo + Name + Email + Phone block on Cover Page.
     Returns dict: {"xlsm": None, "pdf": bytes, "docx": bytes}
     """
+    if not file_bytes:
+        raise ValueError("Source PDF file is empty.")
+
     text_details = text_details or {}
     company_name = text_details.get("company_name", "") or footer_company
     email_addr = text_details.get("email", "")
@@ -272,12 +342,28 @@ def process_pdf(
 
         page1.insert_image(rect_cover, stream=composite_logo_bytes, keep_proportion=True)
 
-    # B. Global 69-Page Footer Replacement
+    # B. Global Multi-Page Footer Replacement (batch annotations before redaction)
     for page in doc:
-        # Search & redact "THE MIND MYSTERY"
+        company_insertions = []
         for rect in page.search_for("THE MIND MYSTERY"):
             page.add_redact_annot(rect, fill=(1, 1, 1))
+            company_insertions.append(rect)
+
+        contact_insertions = []
+        contact_matches = page.search_for("Support- 8075891014")
+        if not contact_matches:
+            contact_matches = page.search_for("mindmysteryinstitute@hotmail.com")
+
+        for rect in contact_matches:
+            expanded_rect = fitz.Rect(rect.x0 - 60, rect.y0 - 2, rect.x1 + 160, rect.y1 + 2)
+            page.add_redact_annot(expanded_rect, fill=(1, 1, 1))
+            contact_insertions.append(expanded_rect)
+
+        # Apply redactions once per page for integrity and performance
+        if company_insertions or contact_insertions:
             page.apply_redactions()
+
+        for rect in company_insertions:
             page.insert_textbox(
                 rect,
                 footer_company,
@@ -287,17 +373,9 @@ def process_pdf(
                 align=fitz.TEXT_ALIGN_CENTER
             )
 
-        # Search & redact footer contact line
-        contact_matches = page.search_for("Support- 8075891014")
-        if not contact_matches:
-            contact_matches = page.search_for("mindmysteryinstitute@hotmail.com")
-
-        for rect in contact_matches:
-            expanded_rect = fitz.Rect(rect.x0 - 60, rect.y0 - 2, rect.x1 + 160, rect.y1 + 2)
-            page.add_redact_annot(expanded_rect, fill=(1, 1, 1))
-            page.apply_redactions()
+        for rect in contact_insertions:
             page.insert_textbox(
-                expanded_rect,
+                rect,
                 footer_contact,
                 fontsize=8,
                 fontname="helv",
@@ -315,72 +393,83 @@ def process_pdf(
 
 
 def _pdf_to_docx(pdf_bytes: bytes) -> bytes:
-    """Converts PDF bytes to Word (.docx) bytes via pdf2docx."""
+    """Converts PDF bytes to Word (.docx) bytes via pdf2docx using safe isolated temporary directory."""
     if not pdf_bytes:
         return b""
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
-        tmp_pdf.write(pdf_bytes)
-        tmp_pdf_path = tmp_pdf.name
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tmp_pdf_path = os.path.join(temp_dir, "input.pdf")
+        tmp_docx_path = os.path.join(temp_dir, "output.docx")
 
-    tmp_docx_path = tmp_pdf_path.replace(".pdf", ".docx")
-    try:
-        cv = Converter(tmp_pdf_path)
-        cv.convert(tmp_docx_path, start=0, end=None)
-        cv.close()
+        with open(tmp_pdf_path, "wb") as f:
+            f.write(pdf_bytes)
 
-        with open(tmp_docx_path, "rb") as f:
-            docx_bytes = f.read()
-        return docx_bytes
-    except Exception as e:
-        print(f"pdf2docx error: {e}")
-        return b""
-    finally:
-        if os.path.exists(tmp_pdf_path):
-            os.remove(tmp_pdf_path)
-        if os.path.exists(tmp_docx_path):
-            os.remove(tmp_docx_path)
+        try:
+            cv = Converter(tmp_pdf_path)
+            cv.convert(tmp_docx_path, start=0, end=None)
+            cv.close()
+
+            if os.path.exists(tmp_docx_path):
+                with open(tmp_docx_path, "rb") as f:
+                    return f.read()
+        except Exception as e:
+            print(f"pdf2docx conversion error: {e}")
+            return b""
+
+    return b""
 
 
 def _excel_to_pdf(excel_bytes: bytes) -> bytes:
-    """Converts .xlsm Excel bytes to PDF using LibreOffice/soffice CLI."""
-    with tempfile.NamedTemporaryFile(suffix=".xlsm", delete=False) as tmp_excel:
-        tmp_excel.write(excel_bytes)
-        tmp_excel_path = tmp_excel.name
+    """
+    Converts .xlsm Excel bytes to PDF using isolated LibreOffice headless execution.
+    Sandboxes user profile and isolates files in dedicated temporary directory.
+    """
+    if not excel_bytes:
+        return b""
 
-    temp_dir = os.path.dirname(tmp_excel_path)
-    expected_pdf_path = tmp_excel_path.replace(".xlsm", ".pdf")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tmp_excel_path = os.path.join(temp_dir, "input.xlsm")
+        with open(tmp_excel_path, "wb") as f:
+            f.write(excel_bytes)
 
-    lo_binaries = [
-        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-        "/opt/homebrew/bin/soffice",
-        "/opt/homebrew/bin/libreoffice",
-        "soffice",
-        "libreoffice"
-    ]
+        expected_pdf_path = os.path.join(temp_dir, "input.pdf")
+        profile_dir = os.path.join(temp_dir, "lo_profile")
+        os.makedirs(profile_dir, exist_ok=True)
 
-    for lo_cmd in lo_binaries:
-        try:
-            res = subprocess.run(
-                [lo_cmd, "--headless", "--convert-to", "pdf", tmp_excel_path, "--outdir", temp_dir],
-                capture_output=True,
-                timeout=60
-            )
-            if res.returncode == 0 and os.path.exists(expected_pdf_path):
-                with open(expected_pdf_path, "rb") as f:
-                    pdf_bytes = f.read()
+        lo_binaries = [
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            "/opt/homebrew/bin/soffice",
+            "/opt/homebrew/bin/libreoffice",
+            "soffice",
+            "libreoffice"
+        ]
 
-                if os.path.exists(tmp_excel_path):
-                    os.remove(tmp_excel_path)
-                if os.path.exists(expected_pdf_path):
-                    os.remove(expected_pdf_path)
-                return pdf_bytes
-        except Exception:
-            continue
-
-    if os.path.exists(tmp_excel_path):
-        os.remove(tmp_excel_path)
-    if os.path.exists(expected_pdf_path):
-        os.remove(expected_pdf_path)
+        for lo_cmd in lo_binaries:
+            try:
+                res = subprocess.run(  # noqa: S603
+                    [
+                        lo_cmd,
+                        "--headless",
+                        "--nodefault",
+                        "--nolockcheck",
+                        "--nologo",
+                        "--norestore",
+                        f"-env:UserInstallation=file://{profile_dir}",
+                        "--convert-to", "pdf",
+                        tmp_excel_path,
+                        "--outdir", temp_dir
+                    ],
+                    capture_output=True,
+                    timeout=45,
+                    check=False
+                )
+                if res.returncode == 0 and os.path.exists(expected_pdf_path):
+                    with open(expected_pdf_path, "rb") as f:
+                        return f.read()
+            except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+                continue
+            except Exception as e:
+                print(f"LibreOffice conversion warning: {e}")
+                continue
 
     return b""

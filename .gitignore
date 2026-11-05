@@ -15,6 +15,10 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Streamlit secrets & credentials
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
 # Internal tool configurations
 .codegraph/
 .rtk/
@@ -23,3 +27,4 @@ Thumbs.db
 # Generated test output documents (large binary files)
 refreacted/*.xlsm
 refreacted/*.pdf
+refreacted/output/

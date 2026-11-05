@@ -1,21 +1,29 @@
-import os
 import io
+import os
 import time
 import zipfile
+from pathlib import Path
+
 from PIL import Image
 from playwright.sync_api import sync_playwright
 
+
 def run_browser_automation():
-    base_dir = "/Users/nakhulgithesh/Documents/work/project-pavi "
-    test_dir = os.path.join(base_dir, "test ")
-    refreacted_dir = os.path.join(base_dir, "refreacted")
+    repo_root = Path(__file__).resolve().parent
+    base_dir = os.environ.get("DMIT_TEST_DIR", str(repo_root / "refreacted"))
+    test_dir = os.path.join(base_dir, "test")
+    refreacted_dir = os.path.join(base_dir, "output")
     os.makedirs(refreacted_dir, exist_ok=True)
 
     excel_file = os.path.join(test_dir, "DMIT 69 pages.xlsm")
-    logo_file = os.path.join(test_dir, "Screenshot 2026-07-28 at 10.58.37 PM.png")
+    logo_file = os.path.join(test_dir, "test_logo.png")
 
     print(f"Excel source file exists: {os.path.exists(excel_file)}")
     print(f"Logo image file exists: {os.path.exists(logo_file)}")
+
+    if not os.path.exists(excel_file) or not os.path.exists(logo_file):
+        print("Skipping browser test: test fixture files not found.")
+        return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -24,7 +32,7 @@ def run_browser_automation():
 
         print("Navigating to http://localhost:8501 ...")
         page.goto("http://localhost:8501", timeout=30000)
-        page.wait_for_selector("text=DMIT Report Re-Branding Studio", timeout=15000)
+        page.wait_for_selector("text=DMIT Studio Pro", timeout=15000)
 
         # 1. Upload Source Excel file
         print("Uploading source report DMIT 69 pages.xlsm ...")
@@ -90,7 +98,8 @@ def run_browser_automation():
                 if is_match:
                     replaced_count += 1
 
-    print(f"\nVERIFICATION RESULT: {replaced_count} out of 7 logo image files were 100% replaced by the test image!")
+    print(f"\nVERIFICATION RESULT: {replaced_count} out of 7 logo image files were replaced!")
+
 
 if __name__ == "__main__":
     run_browser_automation()
