@@ -1,2 +1,4 @@
 libreoffice
 fonts-dejavu
+zlib1g-dev
+libjpeg-dev
